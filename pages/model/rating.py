@@ -30,8 +30,8 @@ def page_evaluation():
         "임계값을 낮추면 결함을 놓치는 경우(FN)가 줄어 재현율이 높아지는 경향이 있지만, "
         "정상 모듈을 결함으로 잘못 판단하는 경우(FP)가 늘어 정밀도가 낮아질 수 있어."
     )
-    st.session_state.setdefault("decision_threshold", 0.5)
-    threshold = st.slider(
+    .setdefault("decision_threshold", 0.5)
+        threshold = st.slider(
         "평가에 사용할 임계값",
         min_value=0.05,
         max_value=0.95,
@@ -39,7 +39,7 @@ def page_evaluation():
         format="%.2f",
         key="decision_threshold",
     )
-    st.session_state["decision_threshold"] = threshold
+    
     current = evaluate_at_threshold(bundle, threshold)
     metrics = current
 
