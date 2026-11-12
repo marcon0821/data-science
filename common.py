@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -376,3 +377,20 @@ def load_app_data():
     if not feature_columns:
         raise ValueError("예측 대상 defects를 제외한 입력 변수가 없습니다.")
     return raw_df, cleaned_df, feature_columns, duplicate_count, invalid_target_count
+
+def drop_high_correlation_features(df, feature_columns, threshold=0.9):
+    """상관관계가 높은 중복 변수를 찾아 제거할 목록과 축소된 변수 목록을 반환한다."""
+    numeric_columns, _ = get_feature_types(df, feature_columns)
+    if not numeric_columns:
+        return feature_columns, [], None
+
+    # 부호와 상관없이 중복성을 확인하기 위해 절댓값 사용
+    corr_matrix = df[numeric_columns].corr().abs()
+    
+    # 대각선 기준 우상단 행렬만 추출해 A-B 중복 시 하나만 제거되도록 처리
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+    to_drop = [column for column in upper.columns if any(upper[column] >= threshold)]
+    reduced_features = [col for col in feature_columns if col not in to_drop]
+
+    return reduced_features, to_drop, corr_matrix
