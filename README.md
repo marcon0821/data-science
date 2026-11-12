@@ -8,6 +8,7 @@ ChatGPT를 이용한 바이브 코딩으로 제작함
 ## 실행 방법
 
 프로젝트 루트 폴더에서 아래 명령을 실행합니다.
+(스트림릿 사이트에서 자동으로 실행 가능)
 
 ```bash
 pip install -r requirements.txt
