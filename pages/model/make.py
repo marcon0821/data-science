@@ -1,6 +1,6 @@
 import streamlit as st
 
-from common import load_app_data, train_and_evaluate, evaluate_at_threshold
+from common import load_app_data, train_and_evaluate, evaluate_at_threshold, drop_high_correlation_features
 
 st.set_page_config(
     page_title="머신러닝 모델 제작 | 소프트웨어 결함 예측",
@@ -28,11 +28,25 @@ def page_model(cleaned_df, feature_columns):
         "두 모델 모두 class_weight='balanced'를 사용해 학습 데이터의 클래스 개수 차이를 반영합니다. "
         "데이터 분할에도 stratify를 적용해 학습/테스트 데이터의 결함 비율이 비슷하게 유지되도록 합니다."
     )
+    # ... 기존 코드(st.caption("두 모델 모두...")) 아래에 다음을 추가/수정합니다.
+
+    # 데이터 전처리 페이지에서 설정한 임계값을 불러와 변수 축소 적용
+    threshold = st.session_state.get("corr_threshold", 0.90)
+    reduced_features, dropped_features, _ = drop_high_correlation_features(
+        cleaned_df, feature_columns, threshold=threshold
+    )
+
+    if dropped_features:
+        st.info(
+            f"🧹 데이터 전처리 페이지의 설정(임계값 {threshold})에 따라 "
+            f"중복 변수 {len(dropped_features)}개가 학습에서 제외됩니다: {', '.join(dropped_features)}"
+        )
 
     if st.button("모델 학습 시작", type="primary", use_container_width=True):
         try:
             with st.spinner("데이터를 나누고 모델을 학습하는 중입니다..."):
-                result = train_and_evaluate(cleaned_df, feature_columns, selected_model)
+                # 기존의 feature_columns 대신 축소된 reduced_features를 넣어 학습합니다.
+                result = train_and_evaluate(cleaned_df, reduced_features, selected_model)
             st.session_state["model_bundle"] = result
             st.session_state["decision_threshold"] = 0.5
             st.success(f"{selected_model} 학습이 완료되었습니다.")
