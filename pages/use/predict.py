@@ -1,112 +1,659 @@
+"""사용자 입력을 이용한 소프트웨어 결함 예측 페이지.
+
+프로젝트 구조:
+    common.py
+    pages/
+        use/
+            predict.py
+
+전제:
+    pages/model/make.py에서 common.train_and_evaluate()로 학습한 결과가
+    st.session_state["model_bundle"]에 저장되어 있어야 한다.
+"""
+
+import json
+
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
-from common import load_app_data, train_and_evaluate, evaluate_at_threshold
+from common import get_feature_types, load_app_data, load_record
+
 
 st.set_page_config(
-    page_title="머신러닝 모델 제작 | 소프트웨어 결함 예측",
-    page_icon="🧠",
+    page_title="사용자 코드 결함 예측 | 소프트웨어 결함 예측",
+    page_icon="🔍",
     layout="wide",
 )
 
 
-def page_model(cleaned_df, feature_columns):
-    st.header("2. 머신러닝 모델 제작")
-    st.write("분류 모델을 선택하고 학습 데이터 80%, 테스트 데이터 20%로 학습합니다.")
+# JM1 데이터의 특성을 이해하기 쉽도록 화면에서 그룹으로 나눈다.
+FEATURE_GROUPS = {
+    "코드 규모 및 구성": [
+        "loc",
+        "lOCode",
+        "lOComment",
+        "lOBlank",
+        "locCodeAndComment",
+    ],
+    "복잡도 및 분기": [
+        "v(g)",
+        "ev(g)",
+        "iv(g)",
+        "branchCount",
+    ],
+    "연산자·피연산자 지표": [
+        "n",
+        "v",
+        "l",
+        "d",
+        "i",
+        "e",
+        "b",
+        "t",
+        "uniq_Op",
+        "uniq_Opnd",
+        "total_Op",
+        "total_Opnd",
+    ],
+}
 
-    selected_model = st.selectbox(
-        "사용할 분류 모델",
-        ["로지스틱 회귀", "랜덤 포레스트"],
-        help="로지스틱 회귀는 선형 분류 모델이고, 랜덤 포레스트는 여러 결정 트리를 결합한 모델입니다.",
-    )
 
-    st.markdown("**학습 설정**")
-    setting_cols = st.columns(3)
-    setting_cols[0].metric("학습 데이터", "80%")
-    setting_cols[1].metric("테스트 데이터", "20%")
-    setting_cols[2].metric("불균형 처리", "class_weight")
-    st.caption(
-        "두 모델 모두 class_weight='balanced'를 사용해 학습 데이터의 클래스 개수 차이를 반영합니다. "
-        "데이터 분할에도 stratify를 적용해 학습/테스트 데이터의 결함 비율이 비슷하게 유지되도록 합니다."
-    )
+# -----------------------------------------------------------------------------
+# 입력 UI 보조 함수
+# -----------------------------------------------------------------------------
+def _input_key(column):
+    """특성 이름을 Streamlit 위젯의 고유 키로 변환한다."""
+    return f"predict_input_{column}"
 
-    if st.button("모델 학습 시작", type="primary", use_container_width=True):
+
+def _reset_prediction_inputs(feature_columns):
+    """입력 위젯 상태와 마지막 예측 결과를 초기화한다."""
+    for column in feature_columns:
+        st.session_state.pop(_input_key(column), None)
+    st.session_state.pop("last_prediction", None)
+
+
+def _safe_scalar(value):
+    """NumPy 자료형 등을 JSON으로 저장할 수 있는 기본 자료형으로 바꾼다."""
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _prepare_threshold_state():
+    """임계값 위젯을 만들기 전에 공유 세션 값을 유효한 범위로 맞춘다."""
+    key = "decision_threshold"
+
+    if key not in st.session_state:
+        st.session_state[key] = 0.5
+        return
+
+    try:
+        value = float(st.session_state[key])
+    except (TypeError, ValueError):
+        value = 0.5
+
+    value = min(0.95, max(0.05, value))
+    # 슬라이더의 0.05 간격에 맞춘다. 위젯 생성 뒤에는 이 값을 직접 수정하지 않는다.
+    st.session_state[key] = round(round(value / 0.05) * 0.05, 2)
+
+
+def _get_classifier(model):
+    """Pipeline 안에 있는 실제 분류기를 가져온다."""
+    if hasattr(model, "named_steps"):
+        return model.named_steps.get("classifier", model)
+    return model
+
+
+def _get_defect_probability(model, input_df):
+    """클래스 1(결함 있음)에 해당하는 예측 확률을 반환한다."""
+    if not hasattr(model, "predict_proba"):
+        raise ValueError(
+            "현재 저장된 모델에서 predict_proba를 사용할 수 없습니다. "
+            "모델 제작 화면에서 분류 모델을 다시 학습해 주세요."
+        )
+
+    probabilities = model.predict_proba(input_df)[0]
+    classifier = _get_classifier(model)
+    classes = list(classifier.classes_)
+
+    defect_index = None
+    for index, label in enumerate(classes):
         try:
-            with st.spinner("데이터를 나누고 모델을 학습하는 중입니다..."):
-                result = train_and_evaluate(cleaned_df, feature_columns, selected_model)
-            st.session_state["model_bundle"] = result
-            st.session_state["decision_threshold"] = 0.5
-            st.success(f"{selected_model} 학습이 완료되었습니다.")
-        except Exception as error:
-            st.error(
-                "모델을 학습하지 못했습니다. 데이터의 결함 있음/없음 개수와 "
-                f"입력 변수 상태를 확인하세요. 상세 오류: {error}"
+            if int(label) == 1:
+                defect_index = index
+                break
+        except (TypeError, ValueError):
+            if str(label).strip().lower() in {"true", "1", "yes"}:
+                defect_index = index
+                break
+
+    if defect_index is None:
+        raise ValueError(
+            "학습된 모델에서 결함 있음(1) 클래스를 찾지 못했습니다. "
+            "모델 제작 화면에서 모델을 다시 학습해 주세요."
+        )
+
+    return float(probabilities[defect_index])
+
+
+def _render_numeric_input(column, data, meaning):
+    """숫자형 특성의 기본값과 JM1 데이터 범위를 표시한다."""
+    values = pd.to_numeric(data[column], errors="coerce").dropna()
+    default_value = float(values.median()) if not values.empty else 0.0
+    is_integer = (
+        not values.empty
+        and pd.api.types.is_integer_dtype(data[column])
+    )
+    step = 1.0 if is_integer else 0.1
+
+    key = _input_key(column)
+
+    help_text = f"JM1 데이터 범위: {values.min():.4f} ~ {values.max():.4f}" \
+        if not values.empty else "학습 데이터에 숫자값이 없습니다."
+
+    return st.number_input(
+        f"{column} · {meaning}",
+        min_value=0.0,
+        value=default_value,
+        step=step,
+        format="%.4f",
+        key=key,
+        help=help_text,
+    )
+
+
+def _render_categorical_input(column, data, meaning):
+    """범주형 특성은 학습 데이터에 존재하는 선택지만 제공한다."""
+    options = data[column].dropna().unique().tolist()
+    options = sorted(options, key=lambda value: str(value))
+    if not options:
+        options = [""]
+
+    mode_values = data[column].dropna().mode()
+    default_value = mode_values.iloc[0] if not mode_values.empty else options[0]
+    default_index = options.index(default_value) if default_value in options else 0
+
+    key = _input_key(column)
+
+    return st.selectbox(
+        f"{column} · {meaning}",
+        options=options,
+        index=default_index,
+        key=key,
+        help="학습 데이터에 포함된 값 중에서 선택합니다.",
+    )
+
+
+def _render_input_form(feature_columns, usable_data, numeric_columns, record):
+    """JM1 특성을 그룹별로 입력받고 제출 여부와 입력값을 반환한다."""
+    meanings = record.get("variable_meanings", {})
+    input_values = {}
+
+    st.subheader("코드 특성값 입력")
+    st.caption(
+        "각 항목의 기본값은 JM1 데이터의 중앙값 또는 최빈값입니다. "
+        "실제 소스 코드 자체가 아니라, 코드 분석 도구로 계산한 특성값을 입력해야 합니다."
+    )
+
+    # 사전에 정의한 그룹에 먼저 배치하고, 처음 보는 열은 기타 특성으로 보낸다.
+    grouped_columns = {}
+    assigned = set()
+    for group_name, preferred_columns in FEATURE_GROUPS.items():
+        columns = [column for column in preferred_columns if column in feature_columns]
+        if columns:
+            grouped_columns[group_name] = columns
+            assigned.update(columns)
+
+    remaining_columns = [column for column in feature_columns if column not in assigned]
+    if remaining_columns:
+        grouped_columns["기타 특성"] = remaining_columns
+
+    with st.form("prediction_input_form", clear_on_submit=False):
+        for group_name, columns in grouped_columns.items():
+            st.markdown(f"#### {group_name}")
+            input_columns = st.columns(2)
+
+            for index, column in enumerate(columns):
+                meaning = meanings.get(column, "데이터셋 원본 변수")
+                with input_columns[index % 2]:
+                    if column in numeric_columns:
+                        value = _render_numeric_input(column, usable_data, meaning)
+                    else:
+                        value = _render_categorical_input(column, usable_data, meaning)
+                    input_values[column] = _safe_scalar(value)
+
+        submitted = st.form_submit_button(
+            "🔍 결함 예측하기",
+            type="primary",
+            use_container_width=True,
+        )
+
+    return submitted, input_values
+
+
+# -----------------------------------------------------------------------------
+# 결과 분석 함수
+# -----------------------------------------------------------------------------
+def _make_range_comparison(input_values, usable_data, bounds, numeric_columns, meanings):
+    """입력값과 JM1 데이터 중앙값 및 학습 범위를 비교하는 표를 만든다."""
+    rows = []
+
+    for column in numeric_columns:
+        if column not in input_values:
+            continue
+
+        values = pd.to_numeric(usable_data[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+
+        value = float(input_values[column])
+        median = float(values.median())
+        bound = bounds.get(column, {})
+        minimum = float(bound.get("min", values.min()))
+        maximum = float(bound.get("max", values.max()))
+        lower_fence = float(bound.get("lower_fence", minimum))
+        upper_fence = float(bound.get("upper_fence", maximum))
+
+        if value < minimum or value > maximum:
+            status = "학습 데이터 범위 밖"
+        elif value < lower_fence or value > upper_fence:
+            status = "일반 범위에서 벗어남"
+        else:
+            status = "일반 범위"
+
+        rows.append(
+            {
+                "특성": column,
+                "의미": meanings.get(column, ""),
+                "입력값": value,
+                "JM1 데이터 중앙값": median,
+                "학습 최솟값": minimum,
+                "학습 최댓값": maximum,
+                "범위 확인": status,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _render_range_analysis(input_values, usable_data, bundle, numeric_columns, record):
+    """학습 데이터 범위에서 크게 벗어나는 사용자 입력을 안내한다."""
+    st.subheader("입력값과 학습 데이터 비교")
+    comparison = _make_range_comparison(
+        input_values=input_values,
+        usable_data=usable_data,
+        bounds=bundle.get("bounds", {}),
+        numeric_columns=numeric_columns,
+        meanings=record.get("variable_meanings", {}),
+    )
+
+    if comparison.empty:
+        st.info("비교할 숫자형 특성이 없습니다.")
+        return
+
+    outside = comparison[comparison["범위 확인"] == "학습 데이터 범위 밖"]
+    unusual = comparison[comparison["범위 확인"] == "일반 범위에서 벗어남"]
+
+    if not outside.empty:
+        st.warning(
+            "다음 입력값은 학습 데이터의 최솟값~최댓값을 벗어납니다: "
+            + ", ".join(outside["특성"].tolist())
+            + ". 학습 과정에서 충분히 관찰하지 못한 값이므로 예측 결과를 특히 신중하게 해석하세요."
+        )
+    elif not unusual.empty:
+        st.info(
+            "다음 입력값은 학습 데이터의 사분위 범위를 기준으로 일반적인 범위에서 벗어납니다: "
+            + ", ".join(unusual["특성"].tolist())
+            + ". 단순히 특이한 값이라는 뜻이며, 잘못된 입력이라고 확정할 수는 없습니다."
+        )
+    else:
+        st.success("모든 숫자형 입력값이 학습 데이터의 최솟값~최댓값 범위 안에 있습니다.")
+
+    st.dataframe(
+        comparison,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "입력값": st.column_config.NumberColumn(format="%.4f"),
+            "JM1 데이터 중앙값": st.column_config.NumberColumn(format="%.4f"),
+            "학습 최솟값": st.column_config.NumberColumn(format="%.4f"),
+            "학습 최댓값": st.column_config.NumberColumn(format="%.4f"),
+        },
+    )
+
+
+def _get_feature_importance(model, meanings):
+    """학습된 모델의 전체 특성 중요도 또는 계수 크기를 정리한다.
+
+    이 값은 특정 사용자 입력의 원인을 설명하는 개별 기여도가 아니라,
+    학습된 모델 전반에서 사용된 특성의 중요도다.
+    """
+    classifier = _get_classifier(model)
+    preprocessor = model.named_steps.get("preprocessor") if hasattr(model, "named_steps") else None
+
+    try:
+        feature_names = list(preprocessor.get_feature_names_out())
+    except (AttributeError, ValueError):
+        feature_names = []
+
+    values = None
+    value_label = "중요도"
+    directions = None
+
+    if hasattr(classifier, "feature_importances_"):
+        values = list(classifier.feature_importances_)
+        value_label = "특성 중요도"
+    elif hasattr(classifier, "coef_"):
+        coefficients = classifier.coef_
+        if getattr(coefficients, "ndim", 1) == 2:
+            coefficients = coefficients[0] if coefficients.shape[0] == 1 else abs(coefficients).mean(axis=0)
+        values = [float(abs(value)) for value in coefficients]
+        if getattr(classifier.coef_, "ndim", 1) == 2 and classifier.coef_.shape[0] == 1:
+            directions = ["결함 확률 증가 방향" if value > 0 else "결함 확률 감소 방향" for value in classifier.coef_[0]]
+        value_label = "계수 절댓값"
+
+    if values is None:
+        return pd.DataFrame()
+
+    if not feature_names or len(feature_names) != len(values):
+        feature_names = [f"특성 {index + 1}" for index in range(len(values))]
+
+    rows = []
+    for index, (raw_name, importance) in enumerate(zip(feature_names, values)):
+        # ColumnTransformer가 붙이는 numeric__/categorical__ 접두사를 제거한다.
+        clean_name = raw_name.split("__", 1)[-1]
+        display_name = clean_name
+        if clean_name in meanings:
+            display_name = f"{clean_name} · {meanings[clean_name]}"
+
+        row = {
+            "특성": display_name,
+            value_label: float(importance),
+        }
+        if directions is not None and index < len(directions):
+            row["계수 방향"] = directions[index]
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(value_label, ascending=False).head(10)
+
+
+def _render_feature_importance(bundle, record):
+    """모델 전반의 주요 특성을 Plotly 막대그래프로 표시한다."""
+    with st.expander("📊 모델이 전반적으로 중요하게 사용한 특성", expanded=False):
+        importance_df = _get_feature_importance(
+            bundle["model"],
+            record.get("variable_meanings", {}),
+        )
+
+        if importance_df.empty:
+            st.info("현재 모델에서 특성 중요도 또는 계수를 가져오지 못했습니다.")
+            return
+
+        value_column = importance_df.columns[1]
+        chart_df = importance_df.sort_values(value_column, ascending=True)
+        fig = go.Figure(
+            go.Bar(
+                x=chart_df[value_column],
+                y=chart_df["특성"],
+                orientation="h",
+                text=chart_df[value_column].map(lambda value: f"{value:.4f}"),
+                textposition="outside",
             )
+        )
+        fig.update_layout(
+            title="모델에서 중요도가 높은 상위 10개 특성",
+            xaxis_title=value_column,
+            yaxis_title="",
+            height=max(360, 34 * len(chart_df)),
+            margin=dict(l=10, r=40, t=60, b=20),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        if bundle.get("model_name") == "랜덤 포레스트":
+            st.caption(
+                "랜덤 포레스트의 특성 중요도는 여러 결정 트리의 분할에서 각 특성이 "
+                "얼마나 활용되었는지를 요약한 값입니다."
+            )
+        else:
+            st.caption(
+                "로지스틱 회귀의 계수 절댓값을 비교했습니다. 입력 변수가 표준화된 모델에서 "
+                "계수 크기는 상대적인 영향력을 살펴보는 데 활용할 수 있습니다."
+            )
+
+        st.caption(
+            "주의: 이 그래프는 모델 전체의 특성 중요도를 보여줍니다. "
+            "이번 입력값의 결함 예측이 특정 특성 하나 때문에 발생했다고 의미하지는 않습니다."
+        )
+
+
+def _render_prediction_result(bundle, usable_data, numeric_columns, record):
+    """마지막으로 제출한 입력값의 예측 결과를 표시한다."""
+    result = st.session_state.get("last_prediction")
+    if not result:
+        return
+
+    input_values = result["input_values"]
+    defect_probability = float(result["defect_probability"])
+    threshold = float(st.session_state.get("decision_threshold", 0.5))
+    prediction = 1 if defect_probability >= threshold else 0
+
+    st.divider()
+    st.subheader("예측 결과")
+    st.caption(
+        f"사용 모델: {bundle.get('model_name', '알 수 없음')} · "
+        "마지막으로 제출한 입력값에 대한 결과"
+    )
+
+    result_left, result_right = st.columns([1, 2])
+    with result_left:
+        if prediction == 1:
+            st.error("🚨 결함 있음으로 분류")
+        else:
+            st.success("✅ 결함 없음으로 분류")
+        st.metric("결함 발생 예측 확률", f"{defect_probability * 100:.2f}%")
+        st.caption(f"현재 임계값: {threshold:.2f} ({threshold * 100:.0f}%)")
+
+    with result_right:
+        probability_fig = go.Figure(
+            go.Bar(
+                x=["결함 발생 확률"],
+                y=[defect_probability * 100],
+                text=[f"{defect_probability * 100:.2f}%"],
+                textposition="outside",
+            )
+        )
+        probability_fig.update_layout(
+            title="모델의 결함 발생 예측 확률",
+            yaxis_title="확률(%)",
+            yaxis=dict(range=[0, 110]),
+            xaxis_title="",
+            showlegend=False,
+            height=310,
+            margin=dict(l=20, r=20, t=60, b=20),
+        )
+        st.plotly_chart(probability_fig, use_container_width=True)
+
+    st.caption(
+        "임계값은 확률을 결함 있음/없음으로 구분하는 기준입니다. "
+        "임계값을 바꾸면 분류 결과는 달라질 수 있지만, 모델이 계산한 예측 확률 자체는 바뀌지 않습니다."
+    )
+
+    if prediction == 1:
+        st.warning(
+            "모델이 이 모듈을 결함이 있을 가능성이 있는 것으로 분류했습니다. "
+            "코드 검토와 테스트를 추가로 진행하는 것이 좋습니다."
+        )
+    else:
+        st.info(
+            "모델은 결함 없음으로 분류했습니다. 다만 결함이 없다는 보장은 아니므로 "
+            "일반적인 코드 리뷰와 테스트는 계속 필요합니다."
+        )
+
+    _render_range_analysis(
+        input_values=input_values,
+        usable_data=usable_data,
+        bundle=bundle,
+        numeric_columns=numeric_columns,
+        record=record,
+    )
+
+    st.subheader("입력한 특성값")
+    input_table = pd.DataFrame(
+        [
+            {
+                "특성": column,
+                "우리말 뜻": record.get("variable_meanings", {}).get(column, ""),
+                "입력값": value,
+            }
+            for column, value in input_values.items()
+        ]
+    )
+    st.dataframe(input_table, use_container_width=True, hide_index=True)
+
+    # 마지막 결과를 JSON으로 내려받을 수 있게 한다.
+    export_data = {
+        "model_name": bundle.get("model_name"),
+        "defect_probability": defect_probability,
+        "decision_threshold": threshold,
+        "prediction": "결함 있음" if prediction == 1 else "결함 없음",
+        "input_values": input_values,
+        "note": "모델의 통계적 예측이며 실제 결함 여부를 확정하지 않습니다.",
+    }
+    st.download_button(
+        "⬇️ 예측 결과 JSON 다운로드",
+        data=json.dumps(export_data, ensure_ascii=False, indent=4),
+        file_name="software_defect_prediction.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    _render_feature_importance(bundle, record)
+
+    if bundle.get("dropped_empty_columns"):
+        st.caption(
+            "학습 데이터에 값이 전혀 없어 모델에서 제외된 특성: "
+            + ", ".join(bundle["dropped_empty_columns"])
+        )
+
+    st.info(
+        "중요한 한계: 이 프로그램은 JM1 데이터의 코드 통계 특성을 학습해 "
+        "결함 가능성을 분류합니다. 실제 버그가 있는 코드 줄이나 위치를 찾아내는 "
+        "정적 분석 도구는 아닙니다. 예측 확률도 실제 결함 발생 빈도와 정확히 일치한다고 보장할 수 없습니다."
+    )
+
+
+# -----------------------------------------------------------------------------
+# 페이지 실행
+# -----------------------------------------------------------------------------
+def main():
+    st.title("🔍 사용자 코드 결함 예측")
+    st.write(
+        "소프트웨어 모듈의 코드 특성값을 직접 입력하면, "
+        "학습된 머신러닝 모델이 결함 발생 가능성을 예측합니다."
+    )
 
     bundle = st.session_state.get("model_bundle")
-    if bundle:
-        st.divider()
-        st.subheader("학습 결과")
-        if bundle["model_name"] != selected_model:
-            st.warning(
-                f"현재 선택은 {selected_model}이지만, 저장된 학습 결과는 "
-                f"{bundle['model_name']}입니다. 새 모델을 학습하려면 위 버튼을 누르세요."
-            )
-        result_cols = st.columns(3)
-        result_cols[0].metric("사용 모델", bundle["model_name"])
-        result_cols[1].metric("학습 데이터", f"{bundle['train_rows']:,}개")
-        result_cols[2].metric("테스트 데이터", f"{bundle['test_rows']:,}개")
-        st.write(f"학습에 사용된 입력 변수: {len(bundle['feature_columns'])}개")
-        if bundle["dropped_empty_columns"]:
-            st.warning(
-                "모든 값이 결측이라 학습에서 제외된 열: "
-                + ", ".join(bundle["dropped_empty_columns"])
-            )
+    if not bundle:
+        st.warning("먼저 '머신러닝 모델 제작' 화면에서 모델을 학습해 주세요.")
+        st.info("모델 학습이 완료되면 이 화면에서 특성값을 입력하고 예측할 수 있습니다.")
+        return
 
-        st.subheader("예측 임계값 설정")
-        st.write(
-            "모델은 각 모듈의 결함 발생 확률을 계산한 뒤, 설정한 임계값과 비교해 "
-            "'결함 있음' 또는 '결함 없음'으로 분류합니다."
+    required_keys = {"model", "feature_columns", "bounds"}
+    missing_keys = required_keys.difference(bundle.keys())
+    if missing_keys:
+        st.error(
+            "저장된 모델 정보가 현재 예측 화면과 호환되지 않습니다. "
+            "모델 제작 화면에서 모델을 다시 학습해 주세요. "
+            f"누락된 항목: {', '.join(sorted(missing_keys))}"
         )
-        st.session_state.setdefault("decision_threshold", 0.5)
+        return
+
+    try:
+        with st.spinner("JM1 데이터와 변수 정보를 준비하는 중입니다..."):
+            _, cleaned_df, _, _, _ = load_app_data()
+
+        feature_columns = bundle["feature_columns"]
+        missing_columns = [column for column in feature_columns if column not in cleaned_df.columns]
+        if missing_columns:
+            st.error(
+                "현재 데이터에서 학습 당시의 입력 변수를 찾지 못했습니다: "
+                + ", ".join(missing_columns)
+            )
+            return
+
+        usable_data = cleaned_df[feature_columns].copy()
+        numeric_columns, _ = get_feature_types(usable_data, feature_columns)
+
+        if "record" not in st.session_state:
+            st.session_state["record"] = load_record()
+        record = st.session_state["record"]
+
+        st.markdown(
+            f"**학습 모델:** {bundle.get('model_name', '알 수 없음')}  "
+            f"\n**학습에 사용된 특성:** {len(feature_columns)}개"
+        )
+
+        st.divider()
+        st.subheader("분류 임계값 설정")
+        _prepare_threshold_state()
         threshold = st.slider(
-            "결함 있음으로 판단할 최소 확률(임계값)",
+            "결함 있음으로 판단할 최소 확률",
             min_value=0.05,
             max_value=0.95,
             step=0.05,
             format="%.2f",
             key="decision_threshold",
-            help="예를 들어 0.30이면 결함 확률이 30% 이상일 때 결함 있음으로 분류합니다.",
+            help=(
+                "예를 들어 0.30이면 결함 발생 예측 확률이 30% 이상일 때 "
+                "'결함 있음'으로 분류합니다. 모델 성능 평가 화면과 같은 값을 사용합니다."
+            ),
         )
-        st.info(
-            f"현재 임계값은 {threshold:.2f}({threshold * 100:.0f}%)입니다. "
-            f"결함 확률이 {threshold * 100:.0f}% 이상이면 '결함 있음'으로 판단합니다. "
-            "임계값을 낮추면 결함을 더 많이 찾아낼 수 있지만 정상 모듈을 결함으로 오판하는 경우도 늘 수 있습니다."
-        )
-        preview = evaluate_at_threshold(bundle, threshold)
-        preview_cols = st.columns(3)
-        preview_cols[0].metric("현재 임계값 Recall", f"{preview['recall'] * 100:.2f}%")
-        preview_cols[1].metric("현재 임계값 Precision", f"{preview['precision'] * 100:.2f}%")
-        preview_cols[2].metric("현재 임계값 F1-score", f"{preview['f1'] * 100:.2f}%")
         st.caption(
-            "임계값 변경은 학습된 모델을 다시 학습하는 것이 아니라, 같은 예측 확률에 적용하는 "
-            "분류 기준만 바꾸는 기능입니다. 상세 비교는 '모델 성능 평가' 화면에서 확인하세요."
+            f"현재 기준: 결함 확률이 **{threshold * 100:.0f}% 이상**이면 결함 있음으로 분류합니다. "
+            "임계값을 낮추면 결함을 더 많이 찾아낼 수 있지만 정상 모듈을 결함으로 오판할 가능성도 커질 수 있습니다."
         )
-        st.info(
-            "학습이 끝났습니다. 왼쪽 메뉴의 '모델 성능 평가'에서 임계값별 지표와 혼동 행렬을, "
-            "'사용자 코드 결함 예측'에서 직접 입력한 값의 예측 결과를 확인할 수 있습니다."
+
+        st.divider()
+        submitted, input_values = _render_input_form(
+            feature_columns=feature_columns,
+            usable_data=usable_data,
+            numeric_columns=numeric_columns,
+            record=record,
         )
-    else:
-        st.info("아직 학습된 모델이 없습니다. 모델을 선택한 뒤 '모델 학습 시작'을 누르세요.")
 
+        reset_col, help_col = st.columns([1, 3])
+        with reset_col:
+            st.button(
+                "입력값 초기화",
+                on_click=_reset_prediction_inputs,
+                args=(feature_columns,),
+                use_container_width=True,
+            )
+        with help_col:
+            st.caption("초기화하면 모든 항목이 JM1 데이터의 중앙값 또는 최빈값으로 돌아갑니다.")
 
-def main():
-    try:
-        with st.spinner("JM1 데이터셋을 불러오는 중입니다..."):
-            _, cleaned_df, feature_columns, _, _ = load_app_data()
+        if submitted:
+            try:
+                input_df = pd.DataFrame([input_values], columns=feature_columns)
+                probability = _get_defect_probability(bundle["model"], input_df)
+                st.session_state["last_prediction"] = {
+                    "input_values": input_values,
+                    "defect_probability": probability,
+                }
+            except Exception as error:
+                st.error(f"예측을 실행하지 못했습니다. 입력값과 모델을 확인하세요. 상세 오류: {error}")
+
+        _render_prediction_result(
+            bundle=bundle,
+            usable_data=usable_data,
+            numeric_columns=numeric_columns,
+            record=record,
+        )
+
     except Exception as error:
-        st.error(f"데이터를 불러오지 못했습니다. 상세 오류: {error}")
-        return
-    page_model(cleaned_df, feature_columns)
+        st.error(f"예측 화면을 준비하지 못했습니다. 상세 오류: {error}")
 
 
 if __name__ == "__main__":
