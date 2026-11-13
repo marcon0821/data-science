@@ -203,18 +203,21 @@ def make_preprocessor(X_train, model_name):
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
 
-def make_classifier(model_name):
+def make_classifier(model_name, use_class_weight=True):
     """클래스 불균형을 고려한 분류 모델을 생성한다."""
+    # 체크박스 선택에 따라 balanced 또는 None을 적용
+    weight = "balanced" if use_class_weight else None
+    
     if model_name == "로지스틱 회귀":
         return LogisticRegression(
             max_iter=2000,
-            class_weight="balanced",
+            class_weight=weight,
             random_state=42,
         )
 
     return RandomForestClassifier(
         n_estimators=300,
-        class_weight="balanced",
+        class_weight=weight,
         random_state=42,
         n_jobs=-1,
     )
