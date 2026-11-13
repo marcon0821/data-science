@@ -637,6 +637,18 @@ def main():
         if submitted:
             try:
                 input_df = pd.DataFrame([input_values], columns=feature_columns)
+                
+                # --- 신규: 학습할 때 썼던 고급 전처리 똑같이 적용 ---
+                import numpy as np
+                if bundle.get("use_cap") and bundle.get("cap_bounds"):
+                    for col, upper in bundle["cap_bounds"].items():
+                        if col in input_df.columns:
+                            input_df[col] = input_df[col].clip(upper=upper)
+                
+                if bundle.get("use_log"):
+                    input_df[numeric_columns] = np.log1p(input_df[numeric_columns].astype(float))
+                # ----------------------------------------------------
+
                 probability = _get_defect_probability(bundle["model"], input_df)
                 st.session_state["last_prediction"] = {
                     "input_values": input_values,
@@ -644,12 +656,6 @@ def main():
                 }
             except Exception as error:
                 st.error(f"예측을 실행하지 못했습니다. 입력값과 모델을 확인하세요. 상세 오류: {error}")
-
-        _render_prediction_result(
-            bundle=bundle,
-            usable_data=usable_data,
-            numeric_columns=numeric_columns,
-            record=record,
         )
 
     except Exception as error:
