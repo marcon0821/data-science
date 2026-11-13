@@ -203,25 +203,6 @@ def make_preprocessor(X_train, model_name):
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
 
-def make_classifier(model_name, use_class_weight=True):
-    """클래스 불균형을 고려한 분류 모델을 생성한다."""
-    # 체크박스 선택에 따라 balanced 또는 None을 적용
-    weight = "balanced" if use_class_weight else None
-    
-    if model_name == "로지스틱 회귀":
-        return LogisticRegression(
-            max_iter=2000,
-            class_weight=weight,
-            random_state=42,
-        )
-
-    return RandomForestClassifier(
-        n_estimators=300,
-        class_weight=weight,
-        random_state=42,
-        n_jobs=-1,
-    )
-
 
 def calculate_numeric_bounds(X_train):
     """사용자 입력값이 학습 데이터 범위에서 벗어나는지 확인할 통계량."""
@@ -244,8 +225,27 @@ def calculate_numeric_bounds(X_train):
     return bounds
 
 
-def train_and_evaluate(cleaned_df, feature_columns, model_name, use_log=False, use_cap=False, use_smote=False):
-    """8:2 분할, 학습, 테스트 평가를 수행하며 고급 전처리 옵션을 적용한다."""
+def make_classifier(model_name, use_class_weight=True):
+    """클래스 불균형을 고려한 분류 모델을 생성한다."""
+    weight = "balanced" if use_class_weight else None
+    
+    if model_name == "로지스틱 회귀":
+        return LogisticRegression(
+            max_iter=2000,
+            class_weight=weight,
+            random_state=42,
+        )
+
+    return RandomForestClassifier(
+        n_estimators=300,
+        class_weight=weight,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+
+def train_and_evaluate(cleaned_df, feature_columns, model_name, use_log=False, use_cap=False, use_smote=False, use_class_weight=True):
+    """8:2 분할, 학습, 테스트 평가를 수행하며 고급 전처리 및 가중치 옵션을 적용한다."""
     X = cleaned_df[feature_columns].copy()
     y = cleaned_df[TARGET].astype(int).copy()
 
@@ -260,20 +260,15 @@ def train_and_evaluate(cleaned_df, feature_columns, model_name, use_log=False, u
     if X.shape[1] == 0:
         raise ValueError("결측값이 아닌 데이터가 있는 입력 변수가 없습니다.")
 
+    from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y,
     )
-    
-    preprocessor = make_preprocessor(X_train, model_name)
-    # 수정한 함수가 가중치 옵션을 넘겨받도록 변경
-    classifier = make_classifier(model_name, use_class_weight)
 
     numeric_columns, _ = get_feature_types(X_train, list(X_train.columns))
-    
-    # 1. 원본 데이터 기준의 범위를 먼저 저장해둔다 (사용자 예측 입력 비교용)
     original_bounds = calculate_numeric_bounds(X_train)
 
-    # 2. 이상치 제어 (Capping): 상위 1% 값으로 자르기
+    # 1. 이상치 제어 (Capping)
     cap_bounds = {}
     if use_cap and numeric_columns:
         cap_bounds = X_train[numeric_columns].quantile(0.99).to_dict()
@@ -281,16 +276,16 @@ def train_and_evaluate(cleaned_df, feature_columns, model_name, use_log=False, u
             X_train[col] = X_train[col].clip(upper=cap_bounds[col])
             X_test[col] = X_test[col].clip(upper=cap_bounds[col])
 
-    # 3. 로그 변환 (Log Transform): 쏠림 데이터 완화
+    # 2. 로그 변환 (Log Transform)
     if use_log and numeric_columns:
         import numpy as np
         X_train[numeric_columns] = np.log1p(X_train[numeric_columns].astype(float))
         X_test[numeric_columns] = np.log1p(X_test[numeric_columns].astype(float))
 
     preprocessor = make_preprocessor(X_train, model_name)
-    classifier = make_classifier(model_name)
+    classifier = make_classifier(model_name, use_class_weight)
 
-    # 4. SMOTE 적용 (imbalanced-learn 파이프라인 사용)
+    # 3. SMOTE 적용 (imbalanced-learn)
     if use_smote:
         try:
             from imblearn.over_sampling import SMOTE
@@ -334,9 +329,8 @@ def train_and_evaluate(cleaned_df, feature_columns, model_name, use_log=False, u
         "test_rows": int(len(X_test)),
         "feature_columns": list(X.columns),
         "dropped_empty_columns": empty_columns,
-        "bounds": original_bounds, # 원본 범위 저장
+        "bounds": original_bounds,
         "class_counts": y.value_counts().sort_index().to_dict(),
-        # 예측 페이지에서 재사용하기 위해 적용 여부 저장
         "use_log": use_log,
         "use_cap": use_cap,
         "cap_bounds": cap_bounds,
