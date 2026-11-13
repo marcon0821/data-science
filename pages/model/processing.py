@@ -5,7 +5,8 @@ import streamlit as st
 from common import (
     DATA_URL, DATA_SOURCE, TARGET, DEFAULT_MEANINGS,
     load_app_data, load_record, save_record, show_record_editor,
-    get_feature_types,
+    train_and_evaluate, evaluate_at_threshold, get_feature_types,
+    drop_high_correlation_features  # 상관관계 제거 함수 임포트 유지
 )
 
 st.set_page_config(
@@ -81,6 +82,16 @@ def page_data_analysis(raw_df, cleaned_df, feature_columns, duplicate_count,
             f"{invalid_target_count}개 행은 학습에 사용할 수 없어 제외했습니다."
         )
 
+    # 누락되었던 전처리 방법 설명 복구
+    st.subheader("전처리 방법")
+    st.markdown(
+        "- **중복 데이터:** 모든 열의 값이 완전히 동일한 행을 제거합니다.\n"
+        "- **예측 대상 결측값:** `defects`가 비었거나 True/False로 바꿀 수 없는 행은 제외합니다.\n"
+        "- **숫자형 입력 변수:** 학습 데이터의 중앙값으로 결측값을 채웁니다.\n"
+        "- **문자열/범주형 입력 변수:** 학습 데이터의 최빈값으로 결측값을 채우고 원-핫 인코딩합니다.\n"
+        "- **데이터 누수 방지:** `defects`는 X에서 제외하며, 결측값 처리·인코딩·표준화는 학습 데이터에만 맞춥니다."
+    )
+
     st.subheader("결함 있음/없음 데이터 분포")
     target_counts = cleaned_df[TARGET].value_counts().reindex([0, 1], fill_value=0)
     chart_df = pd.DataFrame(
@@ -111,7 +122,7 @@ def page_data_analysis(raw_df, cleaned_df, feature_columns, duplicate_count,
         )
 
     # ------------------------------------------------------------------
-    # [신규 추가] 결함 여부에 따른 특성 분포 비교 (Box Plot)
+    # 1. 새로 추가한 결함 여부에 따른 특성 분포 비교 (Box Plot)
     # ------------------------------------------------------------------
     st.divider()
     st.subheader("📊 결함 여부에 따른 특성 비교 (Box Plot)")
@@ -130,7 +141,6 @@ def page_data_analysis(raw_df, cleaned_df, feature_columns, duplicate_count,
             format_func=lambda x: f"{x} ({meanings.get(x, '설명 없음')})"
         )
         
-        # 그래프를 그리기 위해 데이터프레임 복사 및 결함 레이블 추가
         plot_df = cleaned_df.copy()
         plot_df["결함_레이블"] = plot_df[TARGET].map({0: "정상 (False)", 1: "결함 (True)"})
         
@@ -145,7 +155,6 @@ def page_data_analysis(raw_df, cleaned_df, feature_columns, duplicate_count,
                 title=f"결함 여부에 따른 {selected_feature} 분포",
                 color_discrete_map={"정상 (False)": "#636EFA", "결함 (True)": "#EF553B"}
             )
-            # 극단적인 이상치가 너무 많으면 그래프가 안보이므로, Y축을 적절히 조정할 수 있는 기능 제공
             fig_box.update_layout(xaxis_title="결함 여부", yaxis_title=selected_feature)
             st.plotly_chart(fig_box, use_container_width=True)
             
@@ -159,7 +168,52 @@ def page_data_analysis(raw_df, cleaned_df, feature_columns, duplicate_count,
                 "평균값이 높고 상자그림의 위치가 위로 올라가 있다면, "
                 "해당 특성값이 클수록 결함이 발생할 가능성이 높다는 것을 유추할 수 있습니다."
             )
+
+    # ------------------------------------------------------------------
+    # 2. 누락되었던 상관관계 히트맵 및 다중공선성 제거 복구
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("📊 데이터 상관관계 및 다중공선성(중복 변수) 제거")
+    st.write(
+        "변수들 간의 상관관계를 히트맵으로 확인하고, 상관계수가 너무 높은 "
+        "(다중공선성이 있는) 중복 변수를 모델 학습에서 제외합니다."
+    )
+
+    if "corr_threshold" not in st.session_state:
+        st.session_state["corr_threshold"] = 0.90
     
+    threshold = st.slider(
+        "상관계수 임계값 (이 값 이상이면 중복으로 간주하고 제거)", 
+        min_value=0.50, max_value=1.00, value=st.session_state["corr_threshold"], step=0.05
+    )
+    st.session_state["corr_threshold"] = threshold
+
+    reduced_features, dropped_features, _ = drop_high_correlation_features(
+        cleaned_df, feature_columns, threshold=threshold
+    )
+
+    raw_corr = cleaned_df[numeric_columns].corr()
+
+    fig_corr = px.imshow(
+        raw_corr,
+        text_auto=".2f",
+        color_continuous_scale="RdBu_r",
+        zmin=-1, zmax=1,
+        aspect="auto",
+        title="입력 변수 간 상관관계 히트맵"
+    )
+    st.plotly_chart(fig_corr, use_container_width=True)
+
+    if dropped_features:
+        st.warning(
+            f"상관계수 절댓값이 **{threshold}** 이상인 다음 **{len(dropped_features)}개**의 변수가 "
+            f"중복으로 간주되어 학습에서 제외됩니다:\n\n**{', '.join(dropped_features)}**"
+        )
+    else:
+        st.success(f"상관계수 절댓값이 **{threshold}** 이상인 중복 변수가 없습니다.")
+        
+    st.info("이곳에서 설정한 임계값과 제거된 변수 목록은 '머신러닝 모델 제작' 화면에 자동으로 반영됩니다.")
+
     st.divider()
 
     show_record_editor(record, list(raw_df.columns))
