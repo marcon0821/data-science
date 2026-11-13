@@ -260,6 +260,10 @@ def train_and_evaluate(cleaned_df, feature_columns, model_name, use_log=False, u
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y,
     )
+    
+    preprocessor = make_preprocessor(X_train, model_name)
+    # 수정한 함수가 가중치 옵션을 넘겨받도록 변경
+    classifier = make_classifier(model_name, use_class_weight)
 
     numeric_columns, _ = get_feature_types(X_train, list(X_train.columns))
     
