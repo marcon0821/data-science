@@ -241,8 +241,8 @@ def calculate_numeric_bounds(X_train):
     return bounds
 
 
-def train_and_evaluate(cleaned_df, feature_columns, model_name):
-    """8:2 분할, 학습, 테스트 평가를 한 번에 수행한다."""
+def train_and_evaluate(cleaned_df, feature_columns, model_name, use_log=False, use_cap=False, use_smote=False):
+    """8:2 분할, 학습, 테스트 평가를 수행하며 고급 전처리 옵션을 적용한다."""
     X = cleaned_df[feature_columns].copy()
     y = cleaned_df[TARGET].astype(int).copy()
 
@@ -251,7 +251,6 @@ def train_and_evaluate(cleaned_df, feature_columns, model_name):
     if y.value_counts().min() < 2:
         raise ValueError("각 분류에 최소 2개 이상의 데이터가 있어야 분할할 수 있습니다.")
 
-    # 모든 값이 결측인 입력 변수는 학습할 정보가 없으므로 제외한다.
     empty_columns = [column for column in X.columns if X[column].notna().sum() == 0]
     if empty_columns:
         X = X.drop(columns=empty_columns)
@@ -259,24 +258,50 @@ def train_and_evaluate(cleaned_df, feature_columns, model_name):
         raise ValueError("결측값이 아닌 데이터가 있는 입력 변수가 없습니다.")
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y,
+        X, y, test_size=0.2, random_state=42, stratify=y,
     )
+
+    numeric_columns, _ = get_feature_types(X_train, list(X_train.columns))
+    
+    # 1. 원본 데이터 기준의 범위를 먼저 저장해둔다 (사용자 예측 입력 비교용)
+    original_bounds = calculate_numeric_bounds(X_train)
+
+    # 2. 이상치 제어 (Capping): 상위 1% 값으로 자르기
+    cap_bounds = {}
+    if use_cap and numeric_columns:
+        cap_bounds = X_train[numeric_columns].quantile(0.99).to_dict()
+        for col in numeric_columns:
+            X_train[col] = X_train[col].clip(upper=cap_bounds[col])
+            X_test[col] = X_test[col].clip(upper=cap_bounds[col])
+
+    # 3. 로그 변환 (Log Transform): 쏠림 데이터 완화
+    if use_log and numeric_columns:
+        import numpy as np
+        X_train[numeric_columns] = np.log1p(X_train[numeric_columns].astype(float))
+        X_test[numeric_columns] = np.log1p(X_test[numeric_columns].astype(float))
 
     preprocessor = make_preprocessor(X_train, model_name)
     classifier = make_classifier(model_name)
-    model = Pipeline(
-        steps=[
+
+    # 4. SMOTE 적용 (imbalanced-learn 파이프라인 사용)
+    if use_smote:
+        try:
+            from imblearn.over_sampling import SMOTE
+            from imblearn.pipeline import Pipeline as ImbPipeline
+            model = ImbPipeline(steps=[
+                ("preprocessor", preprocessor),
+                ("smote", SMOTE(random_state=42)),
+                ("classifier", classifier),
+            ])
+        except ImportError:
+            raise ImportError("SMOTE 기능을 사용하려면 터미널에서 'pip install imbalanced-learn'을 실행하세요.")
+    else:
+        model = Pipeline(steps=[
             ("preprocessor", preprocessor),
             ("classifier", classifier),
-        ]
-    )
+        ])
 
     model.fit(X_train, y_train)
-    # 확률을 저장해 두면 임계값을 바꿀 때 모델을 다시 학습하지 않아도 된다.
     probabilities = model.predict_proba(X_test)
     classifier_classes = model.named_steps["classifier"].classes_.tolist()
     defect_probabilities = probabilities[:, classifier_classes.index(1)]
@@ -302,8 +327,12 @@ def train_and_evaluate(cleaned_df, feature_columns, model_name):
         "test_rows": int(len(X_test)),
         "feature_columns": list(X.columns),
         "dropped_empty_columns": empty_columns,
-        "bounds": calculate_numeric_bounds(X_train),
+        "bounds": original_bounds, # 원본 범위 저장
         "class_counts": y.value_counts().sort_index().to_dict(),
+        # 예측 페이지에서 재사용하기 위해 적용 여부 저장
+        "use_log": use_log,
+        "use_cap": use_cap,
+        "cap_bounds": cap_bounds,
     }
 
 
