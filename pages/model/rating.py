@@ -73,6 +73,40 @@ def _make_comparison_dataframe(bundle):
     return pd.DataFrame(rows)
 
 
+def _plot_feature_importance(model_bundle, record):
+    """모델이 학습에 사용한 특성들의 중요도(가중치)를 막대그래프로 시각화한다."""
+    model = model_bundle["model"]
+    feature_names = model_bundle["feature_columns"]
+    
+    # 파이프라인 내부의 분류기 추출
+    classifier = model.named_steps["classifier"] if hasattr(model, "named_steps") else model
+    
+    importances = None
+    if hasattr(classifier, "feature_importances_"):
+        importances = classifier.feature_importances_
+    elif hasattr(classifier, "coef_"):
+        importances = abs(classifier.coef_[0])
+        
+    if importances is not None:
+        meanings = record.get("variable_meanings", {})
+        display_names = [f"{col} ({meanings.get(col, '설명 없음')})" for col in feature_names]
+        
+        df_imp = pd.DataFrame({
+            "특성": display_names,
+            "중요도": importances
+        }).sort_values(by="중요도", ascending=True) # Plotly 가로 막대는 밑에서부터 그려지므로 오름차순 정렬
+        
+        fig = px.bar(
+            df_imp, x="중요도", y="특성", orientation='h',
+            title=f"🧠 {model_bundle['model_name']} 모델의 특성 중요도 (가장 크게 영향을 미친 변수는?)",
+            color="중요도", color_continuous_scale="Teal"
+        )
+        fig.update_layout(height=max(400, len(feature_names) * 30))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("현재 학습된 모델은 특성 중요도를 제공하지 않습니다.")
+
+
 def page_evaluation():
     """테스트 데이터 성능, 혼동 행렬, 임계값별 성능을 보여준다."""
     st.header("3. 모델 성능 평가")
@@ -138,7 +172,7 @@ def page_evaluation():
     st.caption(f"위 지표는 현재 임계값 {threshold:.2f}을 적용한 결과입니다.")
 
     # ------------------------------------------------------------------
-    # [신규] 2. 베이스라인(바보 모델)과의 성능 비교
+    # 2. 베이스라인(바보 모델)과의 성능 비교
     # ------------------------------------------------------------------
     st.divider()
     st.subheader("📋 머신러닝 vs 베이스라인(바보 모델) 성능 비교")
@@ -170,6 +204,20 @@ def page_evaluation():
         "하지만 결함을 찾아내는 능력(재현율)이 0%이므로 실무에선 쓸모가 없습니다. "
         "머신러닝 모델은 재현율과 F1-score를 끌어올려 실제 결함을 탐지해냅니다."
     )
+
+    # ------------------------------------------------------------------
+    # [신규 추가] 특성 중요도 (Feature Importance) 시각화
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("🌟 모델 특성 중요도 (Feature Importance)")
+    st.write(
+        "모델이 소프트웨어 결함을 예측할 때 어떤 변수(특성)를 가장 주요한 기준으로 "
+        "삼았는지 확인합니다."
+    )
+    if "record" in st.session_state:
+        _plot_feature_importance(bundle, st.session_state["record"])
+    else:
+        _plot_feature_importance(bundle, {})
 
     # ------------------------------------------------------------------
     # 3. 혼동 행렬
@@ -213,7 +261,7 @@ def page_evaluation():
     detail_columns[3].metric("TP · 결함을 찾아냄", f"{tp:,}개")
 
     # ------------------------------------------------------------------
-    # [신규] 4. 오류 분석 목록 (놓친 결함 vs 헛짚은 모듈)
+    # 4. 오류 분석 목록 (놓친 결함 vs 헛짚은 모듈)
     # ------------------------------------------------------------------
     st.divider()
     st.subheader("🔍 오류 분석 목록 (놓친 결함 vs 헛짚은 모듈)")
@@ -308,7 +356,7 @@ def page_evaluation():
     )
 
     # ------------------------------------------------------------------
-    # 6. 지표 설명 및 해석상 주의점 (복구됨)
+    # 6. 지표 설명 및 해석상 주의점
     # ------------------------------------------------------------------
     st.divider()
     st.subheader("평가 지표의 의미")
